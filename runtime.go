@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -49,6 +50,8 @@ func NewRuntime() *Runtime {
 	rt.mustRegister("panic", HandlerFunc(panicHandler))
 	rt.mustRegister("flaky-timeout", HandlerFunc(flakyTimeoutHandler))
 	rt.mustRegister("idempotent-sideeffect", HandlerFunc(idempotentSideEffectHandler))
+	rt.mustRegister("ignore-cancel", HandlerFunc(ignoreCancelHandler))
+	rt.mustRegister("sideeffect-counter", HandlerFunc(sideEffectCounterHandler))
 	return rt
 }
 
@@ -178,4 +181,99 @@ func resetSideEffectLog() {
 		sideEffectLog.Delete(k)
 		return true
 	})
+}
+
+// ignoreCancelPayload 指定"不配合取消"处理器的睡眠时长。
+type ignoreCancelPayload struct {
+	SleepMS int `json:"sleepMs"`
+}
+
+// ignoreCancelHandler 刻意不监听 ctx：无论平台是否取消，都睡到指定时长。
+// 用于验证"函数不配合取消时，平台仍按硬截止/撤销在有限时间内给出确定终态并回收实例"。
+func ignoreCancelHandler(_ context.Context, ic InvokeContext, payload []byte) ([]byte, error) {
+	var p ignoreCancelPayload
+	if err := json.Unmarshal(payload, &p); err != nil {
+		return nil, fmt.Errorf("ignore-cancel: invalid payload: %w", err)
+	}
+	time.Sleep(time.Duration(p.SleepMS) * time.Millisecond)
+	return json.Marshal(map[string]any{"sleptMs": p.SleepMS, "instance": ic.InstanceID})
+}
+
+// sideEffectCounter 是供异步链路测试使用的"外部业务系统"模拟：
+//   - invocations：处理器被实际调用的次数（每次尝试都 +1，平台无法合并时暴露重复执行）；
+//   - committed：以平台下发的 IdempotencyKey 去重后真正提交的副作用次数。
+//
+// 平台保证：同一业务操作标识的并发/重复提交只产生一次执行（invocations 不增加）；
+// 一次提交内部的多次尝试共享同一 IdempotencyKey，处理器据此把 committed 压到 1。
+var (
+	secInvocations sync.Map // key -> *int64
+	secCommitted   sync.Map // idempotencyKey -> struct{}（已提交标记）
+)
+
+// sideEffectCounterPayload 控制副作用计数处理器：前 SlowUntilAttempt-1 次尝试睡过头
+// 触发可重试超时，随后一次快速完成并提交副作用。
+type sideEffectCounterPayload struct {
+	Key              string `json:"key"`
+	SlowUntilAttempt int    `json:"slowUntilAttempt"`
+	SlowMS           int    `json:"slowMs"`
+	FastMS           int    `json:"fastMs"`
+}
+
+// sideEffectCounterHandler 每次被调用都先累加 invocations；副作用提交按平台
+// IdempotencyKey 去重（同一键多次尝试只提交一次），随后按尝试次数决定睡超时或成功。
+func sideEffectCounterHandler(ctx context.Context, ic InvokeContext, payload []byte) ([]byte, error) {
+	var p sideEffectCounterPayload
+	if err := json.Unmarshal(payload, &p); err != nil {
+		return nil, fmt.Errorf("sideeffect-counter: invalid payload: %w", err)
+	}
+	if p.Key == "" {
+		return nil, fmt.Errorf("sideeffect-counter: key must not be empty")
+	}
+	iv, _ := secInvocations.LoadOrStore(p.Key, new(int64))
+	invoked := atomicAddOne(iv.(*int64))
+
+	committed := false
+	if ic.IdempotencyKey != "" {
+		_, loaded := secCommitted.LoadOrStore(ic.IdempotencyKey, struct{}{})
+		committed = !loaded
+	}
+
+	wait := p.FastMS
+	if p.SlowUntilAttempt > 0 && ic.Attempt < p.SlowUntilAttempt {
+		wait = p.SlowMS
+	}
+	select {
+	case <-time.After(time.Duration(wait) * time.Millisecond):
+		return json.Marshal(map[string]any{
+			"key": p.Key, "invocations": invoked, "committed": committed,
+			"attempt": ic.Attempt, "instance": ic.InstanceID,
+		})
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+// atomicAddOne 原子自增并返回新值。
+func atomicAddOne(p *int64) int64 {
+	return atomic.AddInt64(p, 1)
+}
+
+// sideEffectInvocations 读取某 key 的处理器被调用次数。
+func sideEffectInvocations(key string) int64 {
+	if v, ok := secInvocations.Load(key); ok {
+		return atomic.LoadInt64(v.(*int64))
+	}
+	return 0
+}
+
+// sideEffectCommitted 报告某幂等键的副作用是否已提交。
+func sideEffectCommitted(key string) bool {
+	_, ok := secCommitted.Load(key)
+	return ok
+}
+
+// resetSideEffectCounter 仅供测试复位。
+func resetSideEffectCounter() {
+	secInvocations.Range(func(k, _ any) bool { secInvocations.Delete(k); return true })
+	secCommitted.Range(func(k, _ any) bool { secCommitted.Delete(k); return true })
 }

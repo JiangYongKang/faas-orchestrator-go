@@ -155,6 +155,84 @@ func (p *InstancePool) Acquire(v *FunctionVersion) (*Instance, error) {
 	return in, nil
 }
 
+// AcquireForRun 在一次池锁临界区内完成"判定闸门 -> 取空闲或冷启动 -> 标记忙碌"，
+// 并在锁内调用 start，保证调用方的记账与实例状态迁移原子可见、不存在
+// "已占并发名额但尚未计入在执"的窗口（异步调度用它与任务状态机联动）。
+// 冷启动在锁外装载处理器后，会在锁内做二次闸门校验，防止并发冷启动双超上限。
+func (p *InstancePool) AcquireForRun(v *FunctionVersion, start func(*Instance) bool) (*Instance, error) {
+	k := versionKey{v.FunctionName, v.Version}
+
+	p.mu.Lock()
+	if p.stop {
+		p.mu.Unlock()
+		return nil, newError(ErrClassPlatform, "instance pool is stopped")
+	}
+	vp := p.vpLocked(k)
+	if vp.inflight >= v.Config.MaxConcurrency {
+		p.mu.Unlock()
+		return nil, newError(ErrClassConcurrency,
+			fmt.Sprintf("version %s@v%d reached max concurrency %d",
+				v.FunctionName, v.Version, v.Config.MaxConcurrency))
+	}
+	if n := len(vp.idle); n > 0 {
+		in := vp.idle[n-1]
+		vp.idle = vp.idle[:n-1]
+		in.mu.Lock()
+		if in.state != InstanceIdle {
+			in.mu.Unlock()
+			p.mu.Unlock()
+			return nil, wrapError(ErrClassPlatform, "idle list held non-idle instance", nil)
+		}
+		in.state = InstanceBusy
+		in.mu.Unlock()
+		vp.busy[in.ID] = in
+		vp.inflight++
+		keep := start(in)
+		p.mu.Unlock()
+		if !keep {
+			p.Abort(in)
+			return nil, newError(ErrClassPlatform, "start callback rejected the acquired instance")
+		}
+		return in, nil
+	}
+	p.mu.Unlock()
+
+	// 冷启动装载处理器在锁外。
+	handler, err := p.runtime.lookup(v.Config.HandlerName)
+	if err != nil {
+		return nil, err
+	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.stop {
+		return nil, newError(ErrClassPlatform, "instance pool is stopped")
+	}
+	vp = p.vpLocked(k)
+	if vp.inflight >= v.Config.MaxConcurrency {
+		return nil, newError(ErrClassConcurrency,
+			fmt.Sprintf("version %s@v%d reached max concurrency %d",
+				v.FunctionName, v.Version, v.Config.MaxConcurrency))
+	}
+	p.idGen++
+	in := &Instance{
+		ID:           fmt.Sprintf("inst-%d", p.idGen),
+		FunctionName: v.FunctionName,
+		Version:      v.Version,
+		handler:      handler,
+		state:        InstanceBusy,
+		createdAt:    time.Now(),
+	}
+	keep := start(in)
+	if !keep {
+		return nil, newError(ErrClassPlatform, "start callback rejected the cold-start instance")
+	}
+	p.all[in.ID] = in
+	vp.busy[in.ID] = in
+	vp.inflight++
+	return in, nil
+}
+
 // Release 正常归还实例：实例恢复 idle 并可被复用；
 // 若 busy 期间已收到回收请求，则终结而不入空闲链表。
 func (p *InstancePool) Release(in *Instance) {

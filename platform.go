@@ -13,12 +13,20 @@ type Platform struct {
 	runtime  *Runtime
 	pool     *InstancePool
 	invoker  *Invoker
+	async    *AsyncManager
 	store    *Store // 可为 nil（纯内存模式）
 }
 
 // NewPlatform 装配一个平台实例；storeDir 为空表示纯内存运行，
 // 非空则启动时载入快照、每次元数据变更后原子落盘。
+// 异步任务链路使用 DefaultAsyncConfig；需要自定义排队容量/调度周期时
+// 使用 NewPlatformWithAsyncConfig。
 func NewPlatform(storeDir string, poolCfg PoolConfig) (*Platform, error) {
+	return NewPlatformWithAsyncConfig(storeDir, poolCfg, DefaultAsyncConfig())
+}
+
+// NewPlatformWithAsyncConfig 与 NewPlatform 相同，但允许指定异步链路配置。
+func NewPlatformWithAsyncConfig(storeDir string, poolCfg PoolConfig, asyncCfg AsyncConfig) (*Platform, error) {
 	reg := NewRegistry()
 	router := NewRouter()
 	runtime := NewRuntime()
@@ -42,12 +50,14 @@ func NewPlatform(storeDir string, poolCfg PoolConfig) (*Platform, error) {
 
 	pool := NewInstancePool(runtime, poolCfg)
 	inv := NewInvoker(reg, router, pool)
+	asyncMgr := NewAsyncManager(reg, router, pool, asyncCfg)
 	return &Platform{
 		registry: reg,
 		router:   router,
 		runtime:  runtime,
 		pool:     pool,
 		invoker:  inv,
+		async:    asyncMgr,
 		store:    store,
 	}, nil
 }
@@ -162,5 +172,66 @@ func (p *Platform) PoolStats() PoolStats {
 
 // Close 停止后台回收并释放实例。
 func (p *Platform) Close() {
+	p.async.Stop()
 	p.pool.Stop()
+}
+
+// ---- 异步任务链路 ----
+
+// SubmitAsync 以规范化请求提交异步任务，立即返回稳定的任务凭证。
+func (p *Platform) SubmitAsync(req *InvokeRequest) (string, error) {
+	return p.async.Submit(req)
+}
+
+// QueryAsync 凭凭证查询任务结论；反复查询始终得到同一份确定结论。
+func (p *Platform) QueryAsync(taskID string) (*TaskSnapshot, error) {
+	return p.async.Query(taskID)
+}
+
+// CancelAsync 主动撤销任务；终态任务保持原终态并返回该终态快照。
+func (p *Platform) CancelAsync(taskID string) (*TaskSnapshot, error) {
+	return p.async.Cancel(taskID)
+}
+
+// SubmitAsyncRaw 以原始协议报文提交异步任务，返回按协议编码的凭证报文。
+// 不支持的协议 / 非法字段组合会被明确拒绝，绝不静默降级为同步执行。
+func (p *Platform) SubmitAsyncRaw(raw []byte) ([]byte, error) {
+	req, err := DecodeAsyncSubmit(raw)
+	if err != nil {
+		encoded, _ := EncodeAsyncAck("", "", err)
+		return encoded, err
+	}
+	taskID, subErr := p.async.Submit(req)
+	snap, _ := p.async.Query(taskID)
+	var state TaskState
+	if snap != nil {
+		state = snap.State
+	}
+	encoded, encErr := EncodeAsyncAck(taskID, state, subErr)
+	if encErr != nil {
+		return nil, encErr
+	}
+	return encoded, subErr
+}
+
+// QueryAsyncRaw 以原始协议报文查询任务结论。
+func (p *Platform) QueryAsyncRaw(raw []byte) ([]byte, error) {
+	op, taskID, err := DecodeAsyncOp(raw)
+	if err != nil {
+		encoded, _ := EncodeAsyncStatus(op, nil, err)
+		return encoded, err
+	}
+	snap, qErr := p.async.Query(taskID)
+	return EncodeAsyncStatus(op, snap, qErr)
+}
+
+// CancelAsyncRaw 以原始协议报文撤销任务并返回当前确定结论。
+func (p *Platform) CancelAsyncRaw(raw []byte) ([]byte, error) {
+	op, taskID, err := DecodeAsyncOp(raw)
+	if err != nil {
+		encoded, _ := EncodeAsyncStatus(op, nil, err)
+		return encoded, err
+	}
+	snap, cErr := p.async.Cancel(taskID)
+	return EncodeAsyncStatus(op, snap, cErr)
 }

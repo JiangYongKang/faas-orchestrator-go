@@ -163,7 +163,78 @@ func main() {
 	pretty, _ := prettyJSON(first)
 	fmt.Printf("6 个并发同键调用得到完全一致的结论（副作用仅提交一次）:\n  %s\n", pretty)
 
+	section("9. 异步任务：提交凭证 / 查询终态")
+	must(p.RegisterFunction("jobs"))
+	_, err = p.Publish("jobs", faas.VersionConfig{
+		HandlerName: "echo", Timeout: time.Second,
+		MaxConcurrency: 4, Retry: faas.RetryPolicy{MaxAttempts: 1},
+	})
+	must(err)
+	ackRaw, err := p.SubmitAsyncRaw([]byte(`{"protocol":"2.0","mode":"async","function":"jobs",` +
+		`"idempotencyKey":"job-1","payload":"` + b64(`"background job"`) + `"}`))
+	must(err)
+	fmt.Printf("异步提交立即拿到凭证: %s\n", mustOneString(ackRaw))
+	ack := mustMap(ackRaw)
+	pollAsync(ctx, p, ack["taskId"].(string))
+
+	section("10. 异步：不配合取消也按截止时间强终态 + 回收")
+	must(p.RegisterHandler("stubborn", faas.HandlerFunc(func(_ context.Context, _ faas.InvokeContext, _ []byte) ([]byte, error) {
+		time.Sleep(5 * time.Second) // 刻意忽略 ctx
+		return []byte("late"), nil
+	})))
+	must(p.RegisterFunction("stubborn"))
+	_, err = p.Publish("stubborn", faas.VersionConfig{
+		HandlerName: "stubborn", Timeout: 120 * time.Millisecond,
+		MaxConcurrency: 2, Retry: faas.RetryPolicy{MaxAttempts: 1},
+	})
+	must(err)
+	stubAck, err := p.SubmitAsyncRaw([]byte(`{"protocol":"2.0","mode":"async","function":"stubborn"}`))
+	must(err)
+	stubID := mustMap(stubAck)["taskId"].(string)
+	fmt.Println("提交了一个睡 5s、完全忽略取消的任务，版本硬截止 120ms ...")
+	pollAsync(ctx, p, stubID)
+	fmt.Printf("截止后池状态: %+v（busy 必须为 0，实例被强杀不复用）\n", p.PoolStats())
+
 	fmt.Println("\n全部演示链路结束。")
+}
+
+// mustOneString 把 JSON 报文压成单行便于打印。
+func mustOneString(raw []byte) string {
+	v, err := prettyJSON(string(raw))
+	if err != nil {
+		return string(raw)
+	}
+	return v
+}
+
+// mustMap 解析 JSON 报文为 map。
+func mustMap(raw []byte) map[string]any {
+	var m map[string]any
+	if err := json.Unmarshal(raw, &m); err != nil {
+		fmt.Fprintln(os.Stderr, "bad json:", err)
+		os.Exit(1)
+	}
+	return m
+}
+
+// pollAsync 凭凭证轮询任务直到终态并打印每次观察到的状态。
+func pollAsync(_ context.Context, p *faas.Platform, taskID string) {
+	for i := 0; i < 200; i++ {
+		out, err := p.QueryAsyncRaw([]byte(`{"protocol":"2.0","mode":"async","op":"query","taskId":"` + taskID + `"}`))
+		if err != nil {
+			fmt.Println("查询失败:", err)
+			return
+		}
+		m := mustMap(out)
+		state, _ := m["state"].(string)
+		fmt.Printf("  查询 %s -> state=%s\n", taskID, state)
+		if state == "succeeded" || state == "failed" || state == "timed_out" || state == "canceled" {
+			pretty, _ := prettyJSON(string(out))
+			fmt.Printf("  确定终态: %s\n", pretty)
+			return
+		}
+		time.Sleep(15 * time.Millisecond)
+	}
 }
 
 func section(title string) {
