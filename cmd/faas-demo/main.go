@@ -163,7 +163,92 @@ func main() {
 	pretty, _ := prettyJSON(first)
 	fmt.Printf("6 个并发同键调用得到完全一致的结论（副作用仅提交一次）:\n  %s\n", pretty)
 
+	section("9. 异步任务：提交即得凭证，后台执行，凭凭证查询确定结论")
+	must(p.RegisterFunction("jobs"))
+	_, err = p.Publish("jobs", faas.VersionConfig{
+		HandlerName: "slow", Timeout: 200 * time.Millisecond,
+		MaxConcurrency: 2, Retry: faas.RetryPolicy{MaxAttempts: 1},
+	})
+	must(err)
+
+	// 9.1 提交后立即返回任务凭证，调用方不阻塞。
+	taskID := submitTask(ctx, p, `{"protocol":"2.0","op":"task.submit","function":"jobs","payload":"`+b64(`{"sleepMs":50}`)+`"}`,
+		"提交 50ms 任务（立即返回凭证）")
+	waitTask(ctx, p, taskID, "轮询查询直到终态（预期 succeeded）")
+
+	// 9.2 超过单次执行截止时间：函数不配合也能在有限时间内看到 timed_out。
+	timeoutID := submitTask(ctx, p, `{"protocol":"2.0","op":"task.submit","function":"jobs","payload":"`+b64(`{"sleepMs":800}`)+`"}`,
+		"提交 800ms 任务（版本超时 200ms）")
+	waitTask(ctx, p, timeoutID, "轮询查询直到终态（预期 timed_out，实例被强杀回收）")
+	fmt.Printf("超时回收后池状态: %+v（busy 必须为 0）\n", p.PoolStats())
+
+	// 9.3 调用方主动撤销：查询方在有限时间内看到 canceled。
+	cancelID := submitTask(ctx, p, `{"protocol":"2.0","op":"task.submit","function":"jobs","payload":"`+b64(`{"sleepMs":800}`)+`"}`,
+		"提交 800ms 任务（随后立即撤销）")
+	out, err := p.Call(ctx, []byte(`{"protocol":"2.0","op":"task.cancel","taskId":"`+cancelID+`"}`))
+	must(err)
+	fmt.Printf("撤销响应: %s\n", string(out))
+	waitTask(ctx, p, cancelID, "轮询查询直到终态（预期 canceled）")
+
+	// 9.4 重复提交同一业务标识：返回同一凭证，副作用最多一次。
+	must(p.RegisterFunction("async-orders"))
+	_, err = p.Publish("async-orders", faas.VersionConfig{
+		HandlerName: "idempotent-sideeffect", Timeout: time.Second,
+		MaxConcurrency: 4, Retry: faas.RetryPolicy{MaxAttempts: 2, Backoff: 5 * time.Millisecond},
+	})
+	must(err)
+	dupReq := `{"protocol":"2.0","op":"task.submit","function":"async-orders","idempotencyKey":"order-888","payload":"` + b64(`{"item":"book"}`) + `"}`
+	id1 := submitTask(ctx, p, dupReq, "首次提交 order-888")
+	id2 := submitTask(ctx, p, dupReq, "重复提交 order-888（预期同一凭证）")
+	fmt.Printf("两次提交凭证一致: %v（%s）\n", id1 == id2, id1)
+	waitTask(ctx, p, id1, "等待去重任务终态（副作用恰好一次）")
+
+	// 9.5 策略允许多次尝试但缺幂等键：明确拒绝，不进入可能重复副作用的执行。
+	_, err = p.Call(ctx, []byte(`{"protocol":"2.0","op":"task.submit","function":"async-orders"}`))
+	showErr(err, "可重试策略下缺少 idempotencyKey（预期 invalid_request）")
+
 	fmt.Println("\n全部演示链路结束。")
+}
+
+// submitTask 通过线上协议提交异步任务并打印凭证。
+func submitTask(ctx context.Context, p *faas.Platform, raw, note string) string {
+	out, err := p.Call(ctx, []byte(raw))
+	if err != nil {
+		fmt.Printf("[%s] 提交失败: %v\n", note, err)
+		os.Exit(1)
+	}
+	var sub struct {
+		TaskID string `json:"taskId"`
+		Status string `json:"taskStatus"`
+	}
+	if err := json.Unmarshal(out, &sub); err != nil || sub.TaskID == "" {
+		fmt.Printf("[%s] 提交响应异常: %s\n", note, string(out))
+		os.Exit(1)
+	}
+	fmt.Printf("[%s]\n  凭证: %s（提交时状态 %s，调用方未阻塞）\n", note, sub.TaskID, sub.Status)
+	return sub.TaskID
+}
+
+// waitTask 轮询查询直到任务进入终态并打印结论。
+func waitTask(ctx context.Context, p *faas.Platform, taskID, note string) {
+	for {
+		out, err := p.Call(ctx, []byte(`{"protocol":"2.0","op":"task.query","taskId":"`+taskID+`"}`))
+		if err != nil {
+			fmt.Printf("[%s] 查询失败: %v\n", note, err)
+			os.Exit(1)
+		}
+		var q struct {
+			Status string `json:"taskStatus"`
+			Class  string `json:"errorClass"`
+		}
+		_ = json.Unmarshal(out, &q)
+		switch faas.TaskStatus(q.Status) {
+		case faas.TaskSucceeded, faas.TaskFailed, faas.TaskTimedOut, faas.TaskCanceled:
+			fmt.Printf("[%s]\n  终态: %s %s\n", note, q.Status, q.Class)
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 }
 
 func section(title string) {

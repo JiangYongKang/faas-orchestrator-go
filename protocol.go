@@ -23,14 +23,31 @@ var v2AllowedOptions = map[string]bool{
 	"trace": true,
 }
 
+// RequestOp 标识规范化请求的操作类型。
+type RequestOp string
+
+const (
+	// OpInvoke 同步调用（默认）。
+	OpInvoke RequestOp = "invoke"
+	// OpTaskSubmit 异步任务提交。
+	OpTaskSubmit RequestOp = "task.submit"
+	// OpTaskQuery 异步任务结果查询。
+	OpTaskQuery RequestOp = "task.query"
+	// OpTaskCancel 异步任务撤销。
+	OpTaskCancel RequestOp = "task.cancel"
+)
+
 // InvokeRequest 是平台内部统一的规范化调用请求（与协议版本解耦）。
 type InvokeRequest struct {
-	RoutePath      string // 经由路由调用时填写
-	FunctionName   string // 直接指定函数时填写
-	VersionPin     int    // >0 时钉选版本
-	Payload        []byte // 函数入参
-	IdempotencyKey string // 为空则不做去重
-	CallTimeoutMS  int    // 0 表示沿用版本配置超时；>0 时不得超过版本配置
+	Op             RequestOp // 为空视为 OpInvoke
+	RoutePath      string    // 经由路由调用时填写
+	FunctionName   string    // 直接指定函数时填写
+	VersionPin     int       // >0 时钉选版本
+	Payload        []byte    // 函数入参
+	IdempotencyKey string    // 为空则不做去重
+	CallTimeoutMS  int       // 0 表示沿用版本配置超时；>0 时不得超过版本配置
+	// TaskID 仅 OpTaskQuery / OpTaskCancel 使用。
+	TaskID string
 	// Options 仅允许协议声明过的键；未知键必须被明确拒绝。
 	Options map[string]string
 }
@@ -59,12 +76,14 @@ type wireEnvelopeV1 struct {
 
 type wireEnvelopeV2 struct {
 	Protocol  string            `json:"protocol"`
+	Op        string            `json:"op,omitempty"`
 	Route     string            `json:"route,omitempty"`
 	Function  string            `json:"function,omitempty"`
 	Version   int               `json:"version,omitempty"`
 	Payload   []byte            `json:"payload"`
 	TimeoutMS int               `json:"timeoutMs,omitempty"`
 	IdemKey   string            `json:"idempotencyKey,omitempty"`
+	TaskID    string            `json:"taskId,omitempty"`
 	Options   map[string]string `json:"options,omitempty"`
 }
 
@@ -120,6 +139,26 @@ func decodeV2(raw []byte) (*InvokeRequest, error) {
 	if err := json.Unmarshal(raw, &env); err != nil {
 		return nil, wrapError(ErrClassInvalid, "malformed v2 envelope", err)
 	}
+	op := RequestOp(env.Op)
+	if op == "" {
+		op = OpInvoke
+	}
+	switch op {
+	case OpInvoke, OpTaskSubmit:
+		return decodeV2Invoke(op, &env)
+	case OpTaskQuery, OpTaskCancel:
+		return decodeV2TaskOp(op, &env)
+	default:
+		return nil, newError(ErrClassInvalid,
+			fmt.Sprintf("unsupported op %q (not silently downgraded to sync invoke)", env.Op))
+	}
+}
+
+// decodeV2Invoke 校验同步调用 / 异步提交共用的调用字段。
+func decodeV2Invoke(op RequestOp, env *wireEnvelopeV2) (*InvokeRequest, error) {
+	if env.TaskID != "" {
+		return nil, newError(ErrClassInvalid, "taskId is only allowed for task.query/task.cancel")
+	}
 	if env.Route == "" && env.Function == "" {
 		return nil, newError(ErrClassInvalid, "v2 request requires route or function")
 	}
@@ -135,17 +174,11 @@ func decodeV2(raw []byte) (*InvokeRequest, error) {
 	if env.TimeoutMS < 0 {
 		return nil, newError(ErrClassInvalid, "timeoutMs must be >= 0")
 	}
-	for k, v := range env.Options {
-		if !v2AllowedOptions[k] {
-			return nil, newError(ErrClassInvalid,
-				fmt.Sprintf("unsupported option %q (not silently ignored)", k))
-		}
-		if k == "trace" && v != "on" && v != "off" {
-			return nil, newError(ErrClassInvalid,
-				fmt.Sprintf("invalid value %q for option trace", v))
-		}
+	if err := validateV2Options(env.Options); err != nil {
+		return nil, err
 	}
 	return &InvokeRequest{
+		Op:             op,
 		RoutePath:      env.Route,
 		FunctionName:   env.Function,
 		VersionPin:     env.Version,
@@ -154,6 +187,35 @@ func decodeV2(raw []byte) (*InvokeRequest, error) {
 		CallTimeoutMS:  env.TimeoutMS,
 		Options:        env.Options,
 	}, nil
+}
+
+// decodeV2TaskOp 校验任务查询 / 撤销：只允许携带 taskId，
+// 任何调用字段的混入都是非法字段组合，必须明确拒绝。
+func decodeV2TaskOp(op RequestOp, env *wireEnvelopeV2) (*InvokeRequest, error) {
+	if env.TaskID == "" {
+		return nil, newError(ErrClassInvalid, string(op)+" requires taskId")
+	}
+	if env.Route != "" || env.Function != "" || env.Version != 0 ||
+		env.Payload != nil || env.TimeoutMS != 0 || env.IdemKey != "" || len(env.Options) > 0 {
+		return nil, newError(ErrClassInvalid,
+			string(op)+" only accepts taskId; invoke fields are not allowed in the same request")
+	}
+	return &InvokeRequest{Op: op, TaskID: env.TaskID}, nil
+}
+
+// validateV2Options 校验选项白名单：未知选项 / 非法值明确拒绝。
+func validateV2Options(opts map[string]string) error {
+	for k, v := range opts {
+		if !v2AllowedOptions[k] {
+			return newError(ErrClassInvalid,
+				fmt.Sprintf("unsupported option %q (not silently ignored)", k))
+		}
+		if k == "trace" && v != "on" && v != "off" {
+			return newError(ErrClassInvalid,
+				fmt.Sprintf("invalid value %q for option trace", v))
+		}
+	}
+	return nil
 }
 
 // wireResponseV1 是旧客户端可见的最小确定结构（不暴露 attempts 等新字段）。
@@ -221,4 +283,54 @@ func EncodeResponse(version ProtocolVersion, resp *InvokeResponse, callErr error
 	default:
 		return nil, newError(ErrClassInvalid, "unsupported protocol version: "+string(version))
 	}
+}
+
+// wireTaskResponseV2 是异步任务提交/查询/撤销的线上响应结构。
+type wireTaskResponseV2 struct {
+	Protocol    string `json:"protocol"`
+	OK          bool   `json:"ok"`
+	TaskID      string `json:"taskId,omitempty"`
+	TaskStatus  string `json:"taskStatus,omitempty"`
+	Function    string `json:"function,omitempty"`
+	Version     int    `json:"version,omitempty"`
+	Attempts    int    `json:"attempts,omitempty"`
+	Payload     []byte `json:"payload,omitempty"`
+	ErrorClass  string `json:"errorClass,omitempty"`
+	ErrorReason string `json:"errorReason,omitempty"`
+}
+
+// EncodeTaskResponse 把任务快照编码为线上响应。
+// 异步任务是 v2 能力；v1 报文没有 op 字段，解码阶段不可能产生任务操作，
+// 这里对其他版本做防御性拒绝。
+// ok 表示本次操作（提交/查询/撤销）是否成功；任务自身的终态结论
+// 由 taskStatus 与 errorClass/errorReason 透出，彼此可区分。
+func EncodeTaskResponse(version ProtocolVersion, snap *TaskSnapshot, callErr error) ([]byte, error) {
+	if version != ProtoV2 && version != "" {
+		return nil, newError(ErrClassInvalid, "async tasks require protocol "+string(ProtoV2))
+	}
+	out := wireTaskResponseV2{Protocol: string(ProtoV2), OK: callErr == nil}
+	if callErr != nil {
+		if pe, ok := AsError(callErr); ok {
+			out.ErrorClass = string(pe.Class)
+			out.ErrorReason = pe.Reason
+		} else {
+			out.ErrorClass = string(ErrClassPlatform)
+			out.ErrorReason = callErr.Error()
+		}
+	}
+	if snap != nil {
+		out.TaskID = snap.TaskID
+		out.TaskStatus = string(snap.Status)
+		out.Function = snap.FunctionName
+		out.Version = snap.Version
+		out.Attempts = snap.Attempts
+		if snap.Status == TaskSucceeded {
+			out.Payload = snap.Payload
+		}
+		if snap.ErrorClass != "" {
+			out.ErrorClass = snap.ErrorClass
+			out.ErrorReason = snap.ErrorReason
+		}
+	}
+	return json.Marshal(out)
 }

@@ -25,6 +25,8 @@ const (
 	ErrClassPlatform ErrorClass = "platform_error"
 	// ErrClassRetryExhausted 可重试错误在策略耗尽后的最终包装。
 	ErrClassRetryExhausted ErrorClass = "retry_exhausted"
+	// ErrClassCanceled 异步任务被调用方撤销或平台关停。
+	ErrClassCanceled ErrorClass = "canceled"
 )
 
 // Error 是平台所有对外错误的统一载体。

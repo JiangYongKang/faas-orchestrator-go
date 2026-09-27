@@ -13,6 +13,7 @@ type Platform struct {
 	runtime  *Runtime
 	pool     *InstancePool
 	invoker  *Invoker
+	tasks    *TaskManager
 	store    *Store // 可为 nil（纯内存模式）
 }
 
@@ -48,6 +49,7 @@ func NewPlatform(storeDir string, poolCfg PoolConfig) (*Platform, error) {
 		runtime:  runtime,
 		pool:     pool,
 		invoker:  inv,
+		tasks:    NewTaskManager(inv, DefaultTaskManagerConfig()),
 		store:    store,
 	}, nil
 }
@@ -125,6 +127,8 @@ func (p *Platform) AddRoute(path, function string, versionPin int) error {
 // Call 以原始协议报文发起调用（内部完成版本兼容解码），
 // 返回按请求协议版本编码的响应报文；平台错误同样被编码进报文，
 // 但为了便于程序化判定，非成功时同时返回 error。
+// v2 报文可通过 op 字段选择异步任务操作（task.submit / task.query /
+// task.cancel）；缺省 op=invoke 时行为与旧版完全一致。
 func (p *Platform) Call(ctx context.Context, raw []byte) ([]byte, error) {
 	version, req, err := DecodeRequest(raw)
 	if err != nil {
@@ -132,17 +136,64 @@ func (p *Platform) Call(ctx context.Context, raw []byte) ([]byte, error) {
 		encoded, _ := EncodeResponse(ProtoV2, nil, err)
 		return encoded, err
 	}
-	resp, callErr := p.invoker.Invoke(ctx, req)
-	encoded, encErr := EncodeResponse(version, resp, callErr)
+	switch req.Op {
+	case "", OpInvoke:
+		resp, callErr := p.invoker.Invoke(ctx, req)
+		encoded, encErr := EncodeResponse(version, resp, callErr)
+		if encErr != nil {
+			return nil, encErr
+		}
+		return encoded, callErr
+	case OpTaskSubmit:
+		snap, callErr := p.tasks.Submit(req)
+		return encodeTaskCall(version, snap, callErr)
+	case OpTaskQuery:
+		snap, callErr := p.tasks.Query(req.TaskID)
+		return encodeTaskCall(version, snap, callErr)
+	case OpTaskCancel:
+		snap, callErr := p.tasks.Cancel(req.TaskID)
+		return encodeTaskCall(version, snap, callErr)
+	default:
+		// DecodeRequest 已拒绝未知 op，此处防御兜底。
+		err := newError(ErrClassInvalid, "unsupported op: "+string(req.Op))
+		encoded, _ := EncodeResponse(ProtoV2, nil, err)
+		return encoded, err
+	}
+}
+
+// encodeTaskCall 统一编码任务操作响应。
+func encodeTaskCall(version ProtocolVersion, snap *TaskSnapshot, callErr error) ([]byte, error) {
+	encoded, encErr := EncodeTaskResponse(version, snap, callErr)
 	if encErr != nil {
 		return nil, encErr
 	}
 	return encoded, callErr
 }
 
-// Invoke 以规范化请求发起调用。
+// Invoke 以规范化请求发起同步调用。
+// 携带任务操作（task.*）的请求在此被明确拒绝，绝不静默降级为同步执行；
+// 异步语义请使用 SubmitTask / QueryTask / CancelTask。
 func (p *Platform) Invoke(ctx context.Context, req *InvokeRequest) (*InvokeResponse, error) {
+	if req.Op != "" && req.Op != OpInvoke {
+		return nil, newError(ErrClassInvalid,
+			"Invoke only accepts op=invoke; use SubmitTask/QueryTask/CancelTask for "+string(req.Op))
+	}
 	return p.invoker.Invoke(ctx, req)
+}
+
+// SubmitTask 以规范化请求提交异步任务，立即返回任务凭证。
+func (p *Platform) SubmitTask(req *InvokeRequest) (*TaskSnapshot, error) {
+	return p.tasks.Submit(req)
+}
+
+// QueryTask 按任务凭证查询确定结论。
+func (p *Platform) QueryTask(taskID string) (*TaskSnapshot, error) {
+	return p.tasks.Query(taskID)
+}
+
+// CancelTask 撤销一次异步任务提交。
+func (p *Platform) CancelTask(taskID string) (*TaskSnapshot, error) {
+	return p.tasks.Cancel(taskID)
 }
 
 // ReapIdle 手动触发一轮空闲实例回收。
@@ -160,7 +211,8 @@ func (p *Platform) PoolStats() PoolStats {
 	return p.pool.Stats()
 }
 
-// Close 停止后台回收并释放实例。
+// Close 停止后台回收并释放实例；在途异步任务先被取消并落定终态。
 func (p *Platform) Close() {
+	p.tasks.Stop()
 	p.pool.Stop()
 }
