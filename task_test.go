@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"reflect"
 	"sync"
 	"sync/atomic"
@@ -249,6 +250,156 @@ func TestTask_CancelQueuedTask(t *testing.T) {
 		t.Fatalf("任务 C 应成功，得到 %s", final.Status)
 	}
 	logCase(t, "排队任务被取消后，后续任务不受影响（A、C 均成功）")
+}
+
+// countedHandler 记录每个 token 对应任务"真正开始执行函数"的次数：
+// 自增发生在处理器入口（任何业务动作之前），是"函数被调用"最严格的判据。
+// blocked=true 的任务在槽位释放前会一直阻塞，用于占满唯一并发槽位。
+type countedCancellationHandler struct {
+	mu      sync.Mutex
+	entered map[string]int
+	release chan struct{}
+}
+
+func (h *countedCancellationHandler) Invoke(ctx context.Context, _ InvokeContext, payload []byte) ([]byte, error) {
+	var p struct {
+		Token   string `json:"token"`
+		Blocked bool   `json:"blocked"`
+	}
+	_ = json.Unmarshal(payload, &p)
+	h.mu.Lock()
+	h.entered[p.Token]++
+	h.mu.Unlock()
+	if p.Blocked {
+		select {
+		case <-h.release:
+		case <-ctx.Done():
+		}
+	}
+	return []byte("done:" + p.Token), nil
+}
+
+func (h *countedCancellationHandler) entries(token string) int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.entered[token]
+}
+
+// TestTask_CancelQueuedTaskNeverExecutes 稳定复现并守护以下正确性问题：
+// 并发上限=1 下，排队中（从未开始执行）的任务在占槽任务结束前被撤销后，
+// 绝不能在槽位腾出时被真的执行一遍：
+//   - 被撤销任务的处理器入口调用计数恒为 0（副作用判据）；
+//   - 状态自撤销起稳定停在 canceled，任何时刻都查不到 running/succeeded；
+//   - 被撤销任务不抢槽位、不拖后续：占槽任务结束后正常任务立即成功。
+//
+// 用多轮重复 + 并发查询，覆盖"槽位腾出"与"撤销/轮询"之间的竞态窗口。
+func TestTask_CancelQueuedTaskNeverExecutes(t *testing.T) {
+	const rounds = 25
+	for round := 0; round < rounds; round++ {
+		h := &countedCancellationHandler{
+			entered: map[string]int{},
+			release: make(chan struct{}),
+		}
+		p := newTestPlatform(t, PoolConfig{IdleTTL: time.Hour, MaxIdlePerVersion: 2})
+		assertOK(t, p.RegisterHandler("counted-cancel", h), "装载计数处理器")
+		cfg := testCfg("counted-cancel")
+		cfg.MaxConcurrency = 1
+		publishTaskFn(t, p, "fn", cfg)
+
+		tokenA := fmt.Sprintf("a-%d", round)
+		tokenB := fmt.Sprintf("b-%d", round)
+		tokenC := fmt.Sprintf("c-%d", round)
+
+		// A：占满唯一槽位，直到本用例主动放行才结束。
+		a, err := p.SubmitTask(&InvokeRequest{FunctionName: "fn",
+			Payload: []byte(fmt.Sprintf(`{"token":%q,"blocked":true}`, tokenA))})
+		assertOK(t, err, "提交占槽任务 A")
+		waitTaskStatus(t, p, a.TaskID, TaskRunning)
+
+		// B：槽位已满，停在 queued。
+		b, err := p.SubmitTask(&InvokeRequest{FunctionName: "fn",
+			Payload: []byte(fmt.Sprintf(`{"token":%q}`, tokenB))})
+		assertOK(t, err, "提交排队任务 B")
+		waitTaskStatus(t, p, b.TaskID, TaskQueued)
+
+		// 撤销期间并发反复查询：任何一次观测都不允许出现 running/成功等跳变。
+		stopObs := make(chan struct{})
+		var obsWG sync.WaitGroup
+		obsWG.Add(4)
+		for i := 0; i < 4; i++ {
+			go func() {
+				defer obsWG.Done()
+				for {
+					select {
+					case <-stopObs:
+						return
+					default:
+						s, qerr := p.QueryTask(b.TaskID)
+						if qerr != nil {
+							t.Errorf("查询被撤销任务失败: %v", qerr)
+							return
+						}
+						if s.Status != TaskQueued && s.Status != TaskCanceled {
+							t.Errorf("被撤销排队任务状态非法跳变到 %s", s.Status)
+							return
+						}
+						time.Sleep(time.Millisecond)
+					}
+				}
+			}()
+		}
+
+		cancelSnap, err := p.CancelTask(b.TaskID)
+		assertOK(t, err, "撤销排队任务 B")
+		if cancelSnap.Status != TaskCanceled {
+			t.Fatalf("round %d: B 撤销后应立即 canceled，得到 %s", round, cancelSnap.Status)
+		}
+
+		// 此时 A 仍占着槽位：再多等两个轮询节拍，确认 B 在槽位紧张时没有偷跑。
+		time.Sleep(20 * time.Millisecond)
+		if n := h.entries(tokenB); n != 0 {
+			t.Fatalf("round %d: 被撤销任务在占槽期间已被执行 %d 次（期望 0）", round, n)
+		}
+
+		// 放行 A，唯一槽位腾出：有缺陷的实现会在此刻让 B 真跑一遍。
+		close(h.release)
+		if final := waitTaskTerminal(t, p, a.TaskID); final.Status != TaskSucceeded {
+			t.Fatalf("round %d: 占槽任务 A 应成功，得到 %s", round, final.Status)
+		}
+
+		// C：槽位腾出后提交的正常任务，必须立即（按并发上限）拿到槽位并成功，
+		// 不能被已撤销的 B 拖住或抢槽。
+		c, err := p.SubmitTask(&InvokeRequest{FunctionName: "fn",
+			Payload: []byte(fmt.Sprintf(`{"token":%q}`, tokenC))})
+		assertOK(t, err, "提交后续正常任务 C")
+		if final := waitTaskTerminal(t, p, c.TaskID); final.Status != TaskSucceeded {
+			t.Fatalf("round %d: 后续任务 C 应成功，得到 %s (%s)",
+				round, final.Status, final.ErrorReason)
+		}
+
+		// 给"偷跑"留足时间后做最终判据。
+		time.Sleep(30 * time.Millisecond)
+		close(stopObs)
+		obsWG.Wait()
+
+		if n := h.entries(tokenB); n != 0 {
+			t.Fatalf("round %d: 被撤销任务的函数被调用了 %d 次（必须 0 次，绝不执行）", round, n)
+		}
+		// 被撤销任务不得在实例池留下任何占用：A、C 都已正常结束后 busy 必须为 0。
+		if st := p.PoolStats(); st.Busy != 0 {
+			t.Fatalf("round %d: 被撤销任务不应占用实例，busy=%d stats=%+v", round, st.Busy, st)
+		}
+		bf, err := p.QueryTask(b.TaskID)
+		assertOK(t, err, "最终查询 B")
+		if bf.Status != TaskCanceled || bf.ErrorClass != string(ErrClassCanceled) || bf.Attempts != 0 {
+			t.Fatalf("round %d: B 终态必须稳定为 canceled/canceled/attempts=0，得到 %s/%s/attempts=%d",
+				round, bf.Status, bf.ErrorClass, bf.Attempts)
+		}
+		if n := h.entries(tokenC); n != 1 {
+			t.Fatalf("round %d: 正常任务 C 应恰好执行 1 次，得到 %d 次", round, n)
+		}
+	}
+	logCase(t, "并发上限=1 ×%d 轮：占槽+排队撤销场景下，被撤销任务函数入口计数恒为 0；A、C 均成功；并发查询未见状态跳变", rounds)
 }
 
 func TestTask_ConcurrentDuplicateSubmitSingleSideEffect(t *testing.T) {

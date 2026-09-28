@@ -165,6 +165,12 @@ func (tm *TaskManager) Cancel(taskID string) (*TaskSnapshot, error) {
 	}
 	switch t.status {
 	case TaskQueued:
+		// 置位撤销标记并取消执行上下文：执行协程可能正处于排队轮询、
+		// 也可能与本撤销竞争并发槽位；标记保证任何路径都不会再开始执行。
+		t.cancelReqFlag = true
+		if t.cancel != nil {
+			t.cancel()
+		}
 		tm.finishLocked(t, TaskCanceled, nil, ErrClassCanceled,
 			"task canceled before execution started")
 	case TaskRunning:
@@ -188,6 +194,10 @@ func (tm *TaskManager) Stop() {
 	for _, t := range tm.tasks {
 		switch t.status {
 		case TaskQueued:
+			t.cancelReqFlag = true
+			if t.cancel != nil {
+				t.cancel()
+			}
 			tm.finishLocked(t, TaskCanceled, nil, ErrClassCanceled,
 				"task manager stopped before execution started")
 		case TaskRunning:
@@ -222,6 +232,17 @@ func (tm *TaskManager) cancelRequested(t *task) bool {
 	return t.cancelReqFlag
 }
 
+// beginRunningLocked 在锁内尝试把任务从 queued 原子认领为 running。
+// 已被撤销（或任何非 queued 状态）时返回 false：抢到槽位但认领失败的
+// 调用必须放弃该槽位、绝不启动函数。调用方必须持有 tm.mu。
+func (tm *TaskManager) beginRunningLocked(t *task) bool {
+	if t.status != TaskQueued {
+		return false
+	}
+	t.status = TaskRunning
+	return true
+}
+
 // runTask 是任务的后台执行协程：负责状态推进、按策略重试与终态归类。
 func (tm *TaskManager) runTask(t *task) {
 	defer tm.wg.Done()
@@ -237,7 +258,8 @@ func (tm *TaskManager) runTask(t *task) {
 		return // 提交后、启动前已被取消/关停
 	}
 	// 取消句柄在排队等待并发槽位期间就就位，保证撤销在有限时间内生效；
-	// queued -> running 的迁移发生在首次真正获取到实例时（见 onAcquire）。
+	// queued -> running 的迁移发生在槽位就绪、最终认领成功时
+	// （见 invokeAttemptQueued 的 claimForAttempt）。
 	ctx, cancel := context.WithCancel(context.Background())
 	t.cancel = cancel
 	tm.mu.Unlock()
@@ -250,9 +272,19 @@ func (tm *TaskManager) runTask(t *task) {
 			tm.finishCanceled(t, attempt-1, "task canceled by caller")
 			return
 		}
-		resp, err := tm.invokeAttemptQueued(ctx, t, v, attempt)
+		resp, started, err := tm.invokeAttemptQueued(ctx, t, v, attempt)
 		if tm.cancelRequested(t) {
-			tm.finishCanceled(t, attempt, "task canceled by caller")
+			// 已真正启动处理器的尝试计入 attempts；排队中撤销、从未启动的不计入。
+			n := attempt - 1
+			if started {
+				n = attempt
+			}
+			tm.finishCanceled(t, n, "task canceled by caller")
+			return
+		}
+		if pe, _ := AsError(err); pe != nil && pe.Class == ErrClassCanceled {
+			// 尝试在启动处理器前因撤销/关停被放弃：attempts 不增（从未执行）。
+			tm.finishCanceled(t, attempt-1, pe.Reason)
 			return
 		}
 		if err == nil {
@@ -305,25 +337,61 @@ func (tm *TaskManager) finishFailed(t *task, attempts int, resp *InvokeResponse,
 	tm.mu.Unlock()
 }
 
-// invokeAttemptQueued 执行一次尝试；并发槽位不足时在 queued 语义下
-// 轮询等待（不消耗尝试次数、不静默丢弃），直到槽位可用或任务被撤销。
-// 首次成功获取实例时把任务从 queued 推进到 running。
-func (tm *TaskManager) invokeAttemptQueued(ctx context.Context, t *task, v *FunctionVersion, attempt int) (*InvokeResponse, error) {
-	onAcquire := func() {
-		tm.mu.Lock()
-		if t.status == TaskQueued {
-			t.status = TaskRunning
-		}
-		tm.mu.Unlock()
+// claimForAttempt 在锁内确认任务仍可执行（未撤销、未终态）。
+// begin=true 且任务仍为 queued 时，把状态原子推进到 running（仅在槽位就绪、
+// 即将 Acquire 时发生一次）；begin=false 只做排队期间的可执行性复查，
+// 不改变状态。返回 false 表示任务已失去执行资格——调用方绝不能去抢占槽位。
+func (tm *TaskManager) claimForAttempt(t *task, begin bool) bool {
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+	if t.cancelReqFlag || t.status.IsTerminal() {
+		return false
 	}
+	if begin {
+		// queued -> running 仅发生一次；重试时已是 running，直接确认即可。
+		return tm.beginRunningLocked(t) || t.status == TaskRunning
+	}
+	return t.status == TaskQueued || t.status == TaskRunning
+}
+
+// waitForSlot 探测并发槽位是否可用（不实际占用）；不可用时在 queued/running
+// 语义下轮询等待（不消耗尝试次数、不静默丢弃），直到槽位腾出或任务被撤销。
+func (tm *TaskManager) waitForSlot(ctx context.Context, t *task, v *FunctionVersion) error {
 	for {
-		resp, err := tm.invoker.invokeOnceDetached(ctx, v, t.req, attempt, onAcquire)
-		if pe, ok := AsError(err); ok && pe.Class == ErrClassConcurrency {
-			if serr := sleepContext(ctx, tm.cfg.QueuePollInterval); serr != nil {
-				return nil, wrapError(ErrClassCanceled, "task canceled while queued for a concurrency slot", serr)
-			}
-			continue
+		if tm.invoker.pool.HasAvailableSlot(v) {
+			return nil
 		}
-		return resp, err
+		if serr := sleepContext(ctx, tm.cfg.QueuePollInterval); serr != nil {
+			return wrapError(ErrClassCanceled, "task canceled while queued for a concurrency slot", serr)
+		}
 	}
+}
+
+// invokeAttemptQueued 执行一次尝试，返回 (响应, 本次是否真正启动过处理器, 错误)。
+// started 只在成功 Acquire 并进入 invokeOnceDetached 后为 true——
+// 排队等待、槽位竞态导致的认领放弃都不算"执行过"。
+//
+// 执行流程：
+//  1. 先在 TaskManager 锁内复查执行资格（与撤销线性化，已撤销立即退出，
+//     状态保持 queued，连 Acquire 都不会发生，因而绝不占用实例）；
+//  2. 再探测并发槽位，不足则停留在 queued 轮询等待；
+//  3. 真正 Acquire 之前做最后一次原子认领：queued -> running 与撤销在
+//     同一把锁上线性化，封死"槽位腾出与撤销同时发生"的竞态窗口；
+//     认领成功后立即 Acquire 并启动执行。
+//
+// 重试时任务已是 running，步骤 3 的迁移自然为空操作。
+func (tm *TaskManager) invokeAttemptQueued(ctx context.Context, t *task, v *FunctionVersion, attempt int) (*InvokeResponse, bool, error) {
+	if !tm.claimForAttempt(t, false) {
+		return nil, false, newError(ErrClassCanceled, "task canceled before execution started")
+	}
+	if err := tm.waitForSlot(ctx, t, v); err != nil {
+		return nil, false, err
+	}
+	// 槽位就绪：最终认领（queued -> running 原子发生）；
+	// 若撤销先于本临界区落定，则认领失败，绝不 Acquire。
+	if !tm.claimForAttempt(t, true) {
+		return nil, false, newError(ErrClassCanceled, "task canceled before execution started")
+	}
+	resp, err := tm.invoker.invokeOnceDetached(ctx, v, t.req, attempt)
+	return resp, true, err
 }

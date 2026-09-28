@@ -155,6 +155,20 @@ func (p *InstancePool) Acquire(v *FunctionVersion) (*Instance, error) {
 	return in, nil
 }
 
+// HasAvailableSlot 报告该版本当前是否至少有一个空闲并发槽位。
+// 只做无副作用的探测，不占用实例：供异步任务在排队轮询时使用，
+// 真正的占用仍由后续 Acquire 在池锁内完成（Acquire 会重新校验闸门）。
+func (p *InstancePool) HasAvailableSlot(v *FunctionVersion) bool {
+	k := versionKey{v.FunctionName, v.Version}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.stop {
+		return false
+	}
+	vp := p.vpLocked(k)
+	return vp.inflight < v.Config.MaxConcurrency
+}
+
 // Release 正常归还实例：实例恢复 idle 并可被复用；
 // 若 busy 期间已收到回收请求，则终结而不入空闲链表。
 func (p *InstancePool) Release(in *Instance) {

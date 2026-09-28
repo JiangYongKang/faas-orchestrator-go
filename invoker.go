@@ -182,26 +182,22 @@ func itoa(n int) string {
 // invokeOnce 执行单次尝试（不含重试），返回响应与已归类错误。
 // 同步路径：超时/取消时等待处理器退出，避免 goroutine 泄漏。
 func (iv *Invoker) invokeOnce(ctx context.Context, v *FunctionVersion, req *InvokeRequest, attempt int) (*InvokeResponse, error) {
-	return iv.runAttempt(ctx, v, req, attempt, true, nil)
+	return iv.runAttempt(ctx, v, req, attempt, true)
 }
 
 // invokeOnceDetached 供异步任务使用的单次尝试：
 // 超时/取消时同样强杀实例（不回池、不可复用），但不等待未配合取消的
 // 处理器退出，从而任务能在有限时间内到达确定终态。
-// onAcquire 在实例实际获取成功（函数即将开始执行）时回调，可为 nil。
-func (iv *Invoker) invokeOnceDetached(ctx context.Context, v *FunctionVersion, req *InvokeRequest, attempt int, onAcquire func()) (*InvokeResponse, error) {
-	return iv.runAttempt(ctx, v, req, attempt, false, onAcquire)
+func (iv *Invoker) invokeOnceDetached(ctx context.Context, v *FunctionVersion, req *InvokeRequest, attempt int) (*InvokeResponse, error) {
+	return iv.runAttempt(ctx, v, req, attempt, false)
 }
 
 // runAttempt 是单次尝试的公共实现；waitOnAbort 决定终止路径是否等待
-// 处理器 goroutine 退出；onAcquire 在成功获取实例后回调。
-func (iv *Invoker) runAttempt(ctx context.Context, v *FunctionVersion, req *InvokeRequest, attempt int, waitOnAbort bool, onAcquire func()) (*InvokeResponse, error) {
+// 处理器 goroutine 退出。
+func (iv *Invoker) runAttempt(ctx context.Context, v *FunctionVersion, req *InvokeRequest, attempt int, waitOnAbort bool) (*InvokeResponse, error) {
 	in, err := iv.pool.Acquire(v)
 	if err != nil {
 		return nil, err // concurrency_limited / handler 缺失(not_found) / pool stopped
-	}
-	if onAcquire != nil {
-		onAcquire()
 	}
 
 	timeout, _ := effectiveTimeout(v, req)
