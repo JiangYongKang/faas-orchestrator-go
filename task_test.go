@@ -220,8 +220,25 @@ func TestTask_CancelRunningNonCooperativeHandler(t *testing.T) {
 }
 
 func TestTask_CancelQueuedTask(t *testing.T) {
+	var bCalls atomic.Int32
 	p := newTestPlatform(t, PoolConfig{IdleTTL: time.Hour, MaxIdlePerVersion: 2})
-	cfg := testCfg("slow")
+	assertOK(t, p.RegisterHandler("slow-counted", HandlerFunc(
+		func(ctx context.Context, ic InvokeContext, payload []byte) ([]byte, error) {
+			var p slowPayload
+			if err := json.Unmarshal(payload, &p); err != nil {
+				return nil, err
+			}
+			if p.SleepMS == 77777 {
+				bCalls.Add(1) // 被撤销任务 B 的专属标记：期望始终为 0
+			}
+			select {
+			case <-time.After(time.Duration(p.SleepMS) * time.Millisecond):
+				return []byte("done"), nil
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		})), "装载带调用计数的 slow 处理器")
+	cfg := testCfg("slow-counted")
 	cfg.MaxConcurrency = 1
 	publishTaskFn(t, p, "fn", cfg)
 
@@ -229,7 +246,7 @@ func TestTask_CancelQueuedTask(t *testing.T) {
 	assertOK(t, err, "提交任务 A（占满唯一并发槽位）")
 	waitTaskStatus(t, p, a.TaskID, TaskRunning)
 
-	b, err := p.SubmitTask(&InvokeRequest{FunctionName: "fn", Payload: []byte(`{"sleepMs":10}`)})
+	b, err := p.SubmitTask(&InvokeRequest{FunctionName: "fn", Payload: []byte(`{"sleepMs":77777}`)})
 	assertOK(t, err, "提交任务 B（应排队而非丢弃）")
 	bs := waitTaskStatus(t, p, b.TaskID, TaskQueued)
 	logCase(t, "并发上限=1 时第二个任务处于可观测的 queued 状态（%s）", bs.Status)
@@ -242,13 +259,22 @@ func TestTask_CancelQueuedTask(t *testing.T) {
 	if final := waitTaskTerminal(t, p, a.TaskID); final.Status != TaskSucceeded {
 		t.Fatalf("任务 A 应正常成功，得到 %s", final.Status)
 	}
+	// A 腾出槽位后留足轮询窗口：已撤销的 B 绝不能被真正执行。
+	time.Sleep(100 * time.Millisecond)
+	if n := bCalls.Load(); n != 0 {
+		t.Fatalf("排队中被撤销的任务 B 绝不能执行函数，期望 0 次，实际 %d 次", n)
+	}
+	logCase(t, "槽位腾出后任务 B 的函数调用计数=0（绝不执行、不占实例）")
+	if q, _ := p.QueryTask(b.TaskID); q.Status != TaskCanceled {
+		t.Fatalf("B 必须稳定停在 canceled，得到 %s", q.Status)
+	}
 	// 队列腾挪后后续任务正常执行。
 	c, err := p.SubmitTask(&InvokeRequest{FunctionName: "fn", Payload: []byte(`{"sleepMs":5}`)})
 	assertOK(t, err, "队列腾出后提交任务 C")
 	if final := waitTaskTerminal(t, p, c.TaskID); final.Status != TaskSucceeded {
 		t.Fatalf("任务 C 应成功，得到 %s", final.Status)
 	}
-	logCase(t, "排队任务被取消后，后续任务不受影响（A、C 均成功）")
+	logCase(t, "排队任务被取消后，后续任务不受影响（A、C 均成功，B 零调用）")
 }
 
 func TestTask_ConcurrentDuplicateSubmitSingleSideEffect(t *testing.T) {

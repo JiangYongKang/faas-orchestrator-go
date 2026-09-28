@@ -188,20 +188,26 @@ func (iv *Invoker) invokeOnce(ctx context.Context, v *FunctionVersion, req *Invo
 // invokeOnceDetached 供异步任务使用的单次尝试：
 // 超时/取消时同样强杀实例（不回池、不可复用），但不等待未配合取消的
 // 处理器退出，从而任务能在有限时间内到达确定终态。
-// onAcquire 在实例实际获取成功（函数即将开始执行）时回调，可为 nil。
-func (iv *Invoker) invokeOnceDetached(ctx context.Context, v *FunctionVersion, req *InvokeRequest, attempt int, onAcquire func()) (*InvokeResponse, error) {
+// onAcquire 在实例实际获取成功后、处理器启动前回调，可为 nil；
+// 返回 false 表示该次获取不应继续（例如任务已在排队期间被撤销），
+// 此时实例立即原样归还、处理器绝不会被调用。
+func (iv *Invoker) invokeOnceDetached(ctx context.Context, v *FunctionVersion, req *InvokeRequest, attempt int, onAcquire func() bool) (*InvokeResponse, error) {
 	return iv.runAttempt(ctx, v, req, attempt, false, onAcquire)
 }
 
 // runAttempt 是单次尝试的公共实现；waitOnAbort 决定终止路径是否等待
-// 处理器 goroutine 退出；onAcquire 在成功获取实例后回调。
-func (iv *Invoker) runAttempt(ctx context.Context, v *FunctionVersion, req *InvokeRequest, attempt int, waitOnAbort bool, onAcquire func()) (*InvokeResponse, error) {
+// 处理器 goroutine 退出；onAcquire 在成功获取实例后、处理器启动前回调，
+// 返回 false 时放弃本次获取（实例正常归还，不触发任何业务动作）。
+func (iv *Invoker) runAttempt(ctx context.Context, v *FunctionVersion, req *InvokeRequest, attempt int, waitOnAbort bool, onAcquire func() bool) (*InvokeResponse, error) {
 	in, err := iv.pool.Acquire(v)
 	if err != nil {
 		return nil, err // concurrency_limited / handler 缺失(not_found) / pool stopped
 	}
-	if onAcquire != nil {
-		onAcquire()
+	if onAcquire != nil && !onAcquire() {
+		// 撤销闸门拒绝：实例从未服务过本次调用，正常归还即可，
+		// 绝不让已撤销任务占用/污染实例，也不执行处理器。
+		iv.pool.Release(in)
+		return nil, errAcquireRejected
 	}
 
 	timeout, _ := effectiveTimeout(v, req)

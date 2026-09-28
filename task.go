@@ -43,13 +43,15 @@ type task struct {
 	req     *InvokeRequest   // 提交时的规范化请求（不可变）
 	version *FunctionVersion // 提交时解析的版本快照（配置不可变）
 
-	status        TaskStatus
-	resp          *InvokeResponse
-	errClass      ErrorClass
-	errReason     string
-	attempts      int
-	submittedAt   time.Time
-	finishedAt    time.Time
+	status      TaskStatus
+	resp        *InvokeResponse
+	errClass    ErrorClass
+	errReason   string
+	attempts    int
+	submittedAt time.Time
+	finishedAt  time.Time
+	// cancelReqFlag 是撤销/关停请求标记；置位后排队轮询立即停止、
+	// onAcquire 闸门拒绝任何尚未启动的实例获取。
 	cancelReqFlag bool
 	cancel        context.CancelFunc
 	done          chan struct{} // 进入终态时关闭
